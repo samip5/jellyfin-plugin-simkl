@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics.Tracing;
 using System.IO;
 using System.Net.Http;
@@ -240,6 +241,69 @@ namespace Jellyfin.Plugin.Simkl.API
             }
 
             return history;
+        }
+
+        private static SimklPlayback CreatePlaybackFromItem(BaseItemDto item, float percentageWatched)
+        {
+            var playback = new SimklPlayback();
+            var progress = (int)percentageWatched;
+
+            if (item.IsMovie == true || item.Type == BaseItemKind.Movie)
+            {
+                playback.Movies.Add(new SimklMoviePlayback
+                {
+                    Title = item.OriginalTitle,
+                    Year = item.ProductionYear,
+                    Ids = new SimklMovieIds(item.ProviderIds),
+                    Progress = progress
+                });
+            }
+            else if (item.IsSeries == true || (item.Type == BaseItemKind.Series))
+            {
+                playback.Shows.Add(new SimklShowPlayback
+                {
+                    Title = item.Name,
+                    Year = item.ProductionYear,
+                    Ids = new SimklShowIds(item.ProviderIds),
+                    Progress = progress
+                });
+            }
+            else if (item.Type == BaseItemKind.Episode)
+            {
+                playback.Episodes.Add(new SimklEpisodePlayback
+                {
+                    Title = item.Name,
+                    Season = item.ParentIndexNumber,
+                    Episode = item.IndexNumber,
+                    Ids = new SimklIds(item.ProviderIds ?? new Dictionary<string, string>()),
+                    Progress = progress
+                });
+            }
+
+            return playback;
+        }
+
+        /// <summary>
+        /// Implements /sync/playback method from simkl for now watching.
+        /// </summary>
+        /// <param name="item">Item currently being watched.</param>
+        /// <param name="userToken">User token.</param>
+        /// <param name="percentageWatched">Percentage of item watched.</param>
+        /// <returns>The sync playback response.</returns>
+        public async Task<SyncPlaybackResponse?> SyncPlaybackAsync(BaseItemDto item, string userToken, float percentageWatched)
+        {
+            try
+            {
+                _logger.LogInformation("Syncing Playback");
+                var playback = CreatePlaybackFromItem(item, percentageWatched);
+                return await Post<SyncPlaybackResponse, SimklPlayback>("/sync/playback", userToken, playback);
+            }
+            catch (HttpRequestException e) when (e.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+            {
+                _logger.LogError(e, "Invalid user token {UserToken}, deleting", userToken);
+                SimklPlugin.Instance?.Configuration.DeleteUserToken(userToken);
+                throw new InvalidTokenException("Invalid user token " + userToken);
+            }
         }
 
         /// <summary>

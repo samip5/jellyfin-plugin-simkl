@@ -63,5 +63,25 @@ namespace Jellyfin.Plugin.Simkl.API
 
             return await _simklApi.GetUserSettings(userConfiguration.UserToken);
         }
+
+        /// <summary>
+        /// Syncs playback progress (now watching).
+        /// </summary>
+        /// <param name="userId">The user id.</param>
+        /// <param name="item">The item being watched.</param>
+        /// <returns>The sync playback response.</returns>
+        [HttpPost("sync/playback/{userId}")]
+        public async Task<ActionResult<SyncPlaybackResponse?>> SyncPlayback([FromRoute] Guid userId, [FromBody] MediaBrowser.Model.Dto.BaseItemDto item)
+        {
+            var userConfiguration = SimklPlugin.Instance?.Configuration.GetByGuid(userId);
+            if (userConfiguration == null || string.IsNullOrEmpty(userConfiguration.UserToken))
+            {
+                return Unauthorized();
+            }
+
+            // Calculate progress percentage - for this endpoint, assume it's being sent as-is
+            float progress = 50; // Default to 50% for manual sync
+            return await _simklApi.SyncPlaybackAsync(item, userConfiguration.UserToken, progress);
+        }
     }
 }

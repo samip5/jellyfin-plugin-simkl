@@ -243,6 +243,7 @@ namespace Jellyfin.Plugin.Simkl.API
             return history;
         }
 
+        [Obsolete("Used only by the deprecated SyncPlaybackAsync method.")]
         private static SimklPlayback CreatePlaybackFromItem(BaseItemDto item, float percentageWatched)
         {
             var playback = new SimklPlayback();
@@ -254,17 +255,17 @@ namespace Jellyfin.Plugin.Simkl.API
                 {
                     Title = item.OriginalTitle,
                     Year = item.ProductionYear,
-                    Ids = new SimklMovieIds(item.ProviderIds),
+                    Ids = new SimklMovieIds(item.ProviderIds ?? new Dictionary<string, string>()),
                     Progress = progress
                 });
             }
-            else if (item.IsSeries == true || (item.Type == BaseItemKind.Series))
+            else if (item.IsSeries == true || item.Type == BaseItemKind.Series)
             {
                 playback.Shows.Add(new SimklShowPlayback
                 {
                     Title = item.Name,
                     Year = item.ProductionYear,
-                    Ids = new SimklShowIds(item.ProviderIds),
+                    Ids = new SimklShowIds(item.ProviderIds ?? new Dictionary<string, string>()),
                     Progress = progress
                 });
             }
@@ -283,20 +284,102 @@ namespace Jellyfin.Plugin.Simkl.API
             return playback;
         }
 
+        private static ScrobbleRequest CreateScrobbleRequestFromItem(BaseItemDto item, float percentageWatched)
+        {
+            var request = new ScrobbleRequest { Progress = percentageWatched };
+
+            if (item.IsMovie == true || item.Type == BaseItemKind.Movie)
+            {
+                request.Movie = new ScrobbleMovie
+                {
+                    Title = item.OriginalTitle,
+                    Year = item.ProductionYear,
+                    Ids = new SimklMovieIds(item.ProviderIds ?? new Dictionary<string, string>())
+                };
+            }
+            else if (item.Type == BaseItemKind.Episode)
+            {
+                request.Show = new ScrobbleShow
+                {
+                    Title = item.SeriesName,
+                    Year = item.ProductionYear,
+                    Ids = new SimklShowIds(item.ProviderIds ?? new Dictionary<string, string>())
+                };
+                request.Episode = new ScrobbleEpisode
+                {
+                    Season = item.ParentIndexNumber,
+                    Number = item.IndexNumber
+                };
+            }
+
+            return request;
+        }
+
         /// <summary>
-        /// Implements /sync/playback method from simkl for now watching.
+        /// Deprecated. Use <see cref="ScrobbleStartAsync"/> instead.
+        /// Posts to the legacy /sync/playback endpoint.
         /// </summary>
         /// <param name="item">Item currently being watched.</param>
         /// <param name="userToken">User token.</param>
         /// <param name="percentageWatched">Percentage of item watched.</param>
         /// <returns>The sync playback response.</returns>
+        [Obsolete("Use ScrobbleStartAsync instead, which posts to /scrobble/start.")]
         public async Task<SyncPlaybackResponse?> SyncPlaybackAsync(BaseItemDto item, string userToken, float percentageWatched)
         {
             try
             {
                 _logger.LogDebug("Syncing playback for {ItemName} at {Percentage:F1}%", item.Name, percentageWatched);
+#pragma warning disable CS0618
                 var playback = CreatePlaybackFromItem(item, percentageWatched);
+#pragma warning restore CS0618
                 return await Post<SyncPlaybackResponse, SimklPlayback>("/sync/playback", userToken, playback);
+            }
+            catch (HttpRequestException e) when (e.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+            {
+                _logger.LogError(e, "Invalid user token {UserToken}, deleting", userToken);
+                SimklPlugin.Instance?.Configuration.DeleteUserToken(userToken);
+                throw new InvalidTokenException("Invalid user token " + userToken);
+            }
+        }
+
+        /// <summary>
+        /// Calls /scrobble/start to report that playback has begun.
+        /// </summary>
+        /// <param name="item">Item currently being watched.</param>
+        /// <param name="userToken">User token.</param>
+        /// <param name="percentageWatched">Current playback progress as a percentage (0–100).</param>
+        /// <returns>The scrobble response.</returns>
+        public async Task<SyncPlaybackResponse?> ScrobbleStartAsync(BaseItemDto item, string userToken, float percentageWatched)
+        {
+            try
+            {
+                _logger.LogDebug("Scrobble start for {ItemName} at {Percentage:F1}%", item.Name, percentageWatched);
+                var request = CreateScrobbleRequestFromItem(item, percentageWatched);
+                return await Post<SyncPlaybackResponse, ScrobbleRequest>("/scrobble/start", userToken, request);
+            }
+            catch (HttpRequestException e) when (e.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+            {
+                _logger.LogError(e, "Invalid user token {UserToken}, deleting", userToken);
+                SimklPlugin.Instance?.Configuration.DeleteUserToken(userToken);
+                throw new InvalidTokenException("Invalid user token " + userToken);
+            }
+        }
+
+        /// <summary>
+        /// Calls /scrobble/stop to report that playback has ended.
+        /// Simkl marks the item as watched automatically when progress is ≥80%.
+        /// </summary>
+        /// <param name="item">Item that was watched.</param>
+        /// <param name="userToken">User token.</param>
+        /// <param name="percentageWatched">Final playback progress as a percentage (0–100).</param>
+        /// <returns>The scrobble response.</returns>
+        public async Task<SyncPlaybackResponse?> ScrobbleStopAsync(BaseItemDto item, string userToken, float percentageWatched)
+        {
+            try
+            {
+                _logger.LogDebug("Scrobble stop for {ItemName} at {Percentage:F1}%", item.Name, percentageWatched);
+                var request = CreateScrobbleRequestFromItem(item, percentageWatched);
+                return await Post<SyncPlaybackResponse, ScrobbleRequest>("/scrobble/stop", userToken, request);
             }
             catch (HttpRequestException e) when (e.StatusCode == System.Net.HttpStatusCode.Unauthorized)
             {

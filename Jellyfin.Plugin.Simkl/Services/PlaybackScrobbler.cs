@@ -193,13 +193,13 @@ namespace Jellyfin.Plugin.Simkl.Services
                     eventArgs.Session.UserName);
 
                 var response = await _simklApi
-                    .SyncPlaybackAsync(eventArgs.MediaInfo, userConfig.UserToken, percentageWatched)
+                    .ScrobbleStartAsync(eventArgs.MediaInfo, userConfig.UserToken, percentageWatched)
                     .ConfigureAwait(false);
 
                 if (response != null && string.IsNullOrEmpty(response.Error))
                 {
                     _lastNowWatching[sessionKey] = DateTime.UtcNow;
-                    _logger.LogDebug("Sent now watching without errors");
+                    _logger.LogDebug("Scrobble start sent (action: {Action})", response.Action);
                 }
             }
             catch (JsonException ex)
@@ -258,16 +258,23 @@ namespace Jellyfin.Plugin.Simkl.Services
                     eventArgs.MediaInfo.Path,
                     eventArgs.Session.Id);
 
+                var position = eventArgs.PlaybackPositionTicks;
+                var runtime = eventArgs.MediaInfo.RunTimeTicks;
+                var percentageWatched = position.HasValue && runtime.HasValue && runtime.Value > 0
+                    ? (float)position.Value / runtime.Value * 100f
+                    : userConfig.ScrobblePercentage;
+
                 var response = await _simklApi
-                    .MarkAsWatched(eventArgs.MediaInfo, userConfig.UserToken)
+                    .ScrobbleStopAsync(eventArgs.MediaInfo, userConfig.UserToken, percentageWatched)
                     .ConfigureAwait(false);
 
-                if (response.Success)
+                if (response != null && string.IsNullOrEmpty(response.Error))
                 {
                     _logger.LogInformation(
-                        "Successfully scrobbled {Name} for {UserName}",
+                        "Successfully scrobbled {Name} for {UserName} (action: {Action})",
                         eventArgs.MediaInfo.Name,
-                        eventArgs.Session.UserName);
+                        eventArgs.Session.UserName,
+                        response.Action);
                     _lastScrobbled[eventArgs.Session.Id] = eventArgs.MediaInfo.Id;
                 }
             }

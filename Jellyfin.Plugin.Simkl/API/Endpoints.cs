@@ -1,4 +1,6 @@
 ﻿using System;
+using System.IO;
+using System.Reflection;
 using System.Security.Claims;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.Simkl.API.Objects;
@@ -79,6 +81,29 @@ namespace Jellyfin.Plugin.Simkl.API
             }
 
             return await _simklApi.GetUserSettings(userConfiguration.UserToken);
+        }
+
+        /// <summary>
+        /// Serves the user configuration page.
+        /// </summary>
+        /// <returns>The user configuration HTML page.</returns>
+        [HttpGet("settings")]
+        [Authorize]
+        public IActionResult GetUserSettingsPage()
+        {
+            var assembly = Assembly.GetExecutingAssembly();
+            var resourceName = "Jellyfin.Plugin.Simkl.Configuration.userConfigPage.html";
+
+            using var stream = assembly.GetManifestResourceStream(resourceName);
+            if (stream == null)
+            {
+                return NotFound("User configuration page not found");
+            }
+
+            using var reader = new StreamReader(stream);
+            var content = reader.ReadToEnd();
+
+            return Content(content, "text/html");
         }
 
         /// <summary>

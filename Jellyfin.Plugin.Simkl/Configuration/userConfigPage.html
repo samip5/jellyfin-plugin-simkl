@@ -10,6 +10,10 @@
         <div class="content-primary">
             <h1>Simkl Settings</h1>
             <p>Configure your personal Simkl integration settings.</p>
+            <div id="debugInfo" style="background: #f0f0f0; padding: 10px; margin: 10px 0; font-family: monospace; font-size: 12px;">
+                <strong>Debug Info:</strong><br>
+                <span id="debugStatus">Loading...</span>
+            </div>
             <form id="SimklUserConfigurationForm">
                 <div id="loginButtonContainer" hidden>
                     <h3>You are not logged in to Simkl. Would you like to connect your account?</h3>
@@ -350,24 +354,94 @@
             }
         }
 
+        // Debug function to check what's available
+        function debugJellyfinEnvironment() {
+            console.log("=== Jellyfin Environment Debug ===");
+            console.log("window.ApiClient:", typeof window.ApiClient);
+            console.log("Dashboard:", typeof Dashboard);
+            console.log("Current URL:", window.location.href);
+            console.log("Document ready state:", document.readyState);
+            
+            // Update debug info on page
+            const debugStatus = document.getElementById('debugStatus');
+            if (debugStatus) {
+                debugStatus.innerHTML = 
+                    'ApiClient: ' + typeof window.ApiClient + '<br>' +
+                    'Dashboard: ' + typeof Dashboard + '<br>' +
+                    'URL: ' + window.location.href + '<br>' +
+                    'Ready: ' + document.readyState;
+            }
+        }
+
+        // Run debug immediately
+        debugJellyfinEnvironment();
+
+        // Wait for DOM and try to initialize
+        function initializeSimklConfig() {
+            console.log("Initializing Simkl config...");
+            debugJellyfinEnvironment();
+            
+            if (typeof window.ApiClient === 'undefined') {
+                console.error("ApiClient not available! Retrying in 1 second...");
+                setTimeout(initializeSimklConfig, 1000);
+                return;
+            }
+            
+            if (typeof Dashboard === 'undefined') {
+                console.error("Dashboard not available! Using fallback...");
+                // Create fallback Dashboard object
+                window.Dashboard = {
+                    showLoadingMsg: function() { console.log("Loading..."); },
+                    hideLoadingMsg: function() { console.log("Loading complete"); },
+                    alert: function(msg) { alert(msg); },
+                    processPluginConfigurationUpdateResult: function() { 
+                        console.log("Configuration updated"); 
+                        alert("Settings saved successfully!");
+                    }
+                };
+            }
+            
+            console.log("Starting to load config...");
+            SimklUserConfig.loadConfig().catch(function(error) {
+                console.error("Failed to load config:", error);
+                alert("Failed to load configuration: " + error.message);
+            });
+        }
+
+        // Try multiple initialization strategies
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', initializeSimklConfig);
+        } else {
+            initializeSimklConfig();
+        }
+
+        // Also try when the page shows
         document.querySelector('#SimklUserConfigurationPage')
-            .addEventListener('pageshow', async function () {
-                // noinspection JSUnresolvedVariable
-                Dashboard.showLoadingMsg();
-                await SimklUserConfig.loadConfig();
-                // noinspection JSUnresolvedVariable
-                Dashboard.hideLoadingMsg();
+            ?.addEventListener('pageshow', function () {
+                console.log("Page show event fired");
+                initializeSimklConfig();
             });
 
         document.querySelector('#SimklUserConfigurationForm')
-            .addEventListener('submit', function (e) {
+            ?.addEventListener('submit', function (e) {
                 e.preventDefault();
-
-                // noinspection JSUnresolvedVariable
-                Dashboard.showLoadingMsg();
-                SimklUserConfig.saveConfig();
-                // noinspection JSUnresolvedVariable
-                Dashboard.hideLoadingMsg();
+                console.log("Form submit event fired");
+                
+                if (window.Dashboard && window.Dashboard.showLoadingMsg) {
+                    Dashboard.showLoadingMsg();
+                }
+                
+                SimklUserConfig.saveConfig().then(function() {
+                    if (window.Dashboard && window.Dashboard.hideLoadingMsg) {
+                        Dashboard.hideLoadingMsg();
+                    }
+                }).catch(function(error) {
+                    console.error("Save failed:", error);
+                    if (window.Dashboard && window.Dashboard.hideLoadingMsg) {
+                        Dashboard.hideLoadingMsg();
+                    }
+                    alert("Failed to save: " + error.message);
+                });
             });
     </script>
 </div>

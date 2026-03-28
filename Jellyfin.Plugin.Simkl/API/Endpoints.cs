@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Security.Claims;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.Simkl.API.Objects;
 using Jellyfin.Plugin.Simkl.API.Responses;
@@ -11,7 +12,6 @@ namespace Jellyfin.Plugin.Simkl.API
     /// The simkl endpoints.
     /// </summary>
     [ApiController]
-    [Authorize]
     [Route("Simkl")]
     public class Endpoints : ControllerBase
     {
@@ -31,6 +31,7 @@ namespace Jellyfin.Plugin.Simkl.API
         /// </summary>
         /// <returns>The oauth pin.</returns>
         [HttpGet("oauth/pin")]
+        [Authorize]
         public async Task<ActionResult<CodeResponse?>> GetPin()
         {
             return await _simklApi.GetCode();
@@ -42,6 +43,7 @@ namespace Jellyfin.Plugin.Simkl.API
         /// <param name="userCode">The user auth code.</param>
         /// <returns>The code status response.</returns>
         [HttpGet("oauth/pin/{userCode}")]
+        [Authorize]
         public async Task<ActionResult<CodeStatusResponse?>> GetPinStatus([FromRoute] string userCode)
         {
             return await _simklApi.GetCodeStatus(userCode);
@@ -53,8 +55,23 @@ namespace Jellyfin.Plugin.Simkl.API
         /// <param name="userId">The user id.</param>
         /// <returns>The user settings.</returns>
         [HttpGet("users/settings/{userId}")]
+        [Authorize]
         public async Task<ActionResult<UserSettings?>> GetUserSettings([FromRoute] Guid userId)
         {
+            // Check if the requesting user is the same as the requested user or is an admin
+            var currentUserIdClaim = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+            if (string.IsNullOrEmpty(currentUserIdClaim) || !Guid.TryParse(currentUserIdClaim, out var currentUserId))
+            {
+                return Unauthorized();
+            }
+
+            var isAdmin = User.IsInRole("admin");
+
+            if (currentUserId != userId && !isAdmin)
+            {
+                return Forbid();
+            }
+
             var userConfiguration = SimklPlugin.Instance?.Configuration.GetByGuid(userId);
             if (userConfiguration == null)
             {
@@ -72,6 +89,7 @@ namespace Jellyfin.Plugin.Simkl.API
         /// <param name="progress">Playback progress as a percentage (0–100).</param>
         /// <returns>The scrobble response.</returns>
         [HttpPost("scrobble/start/{userId}")]
+        [Authorize]
         public async Task<ActionResult<SyncPlaybackResponse?>> ScrobbleStart(
             [FromRoute] Guid userId,
             [FromBody] MediaBrowser.Model.Dto.BaseItemDto item,
@@ -95,6 +113,7 @@ namespace Jellyfin.Plugin.Simkl.API
         /// <returns>The sync playback response.</returns>
         [HttpPost("sync/playback/{userId}")]
         [Obsolete("Use POST /Simkl/scrobble/start/{userId}?progress=<float> instead.")]
+        [Authorize]
         public async Task<ActionResult<SyncPlaybackResponse?>> SyncPlayback(
             [FromRoute] Guid userId,
             [FromBody] MediaBrowser.Model.Dto.BaseItemDto item)

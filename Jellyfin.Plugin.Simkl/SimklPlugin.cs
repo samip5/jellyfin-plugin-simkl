@@ -41,10 +41,19 @@ namespace Jellyfin.Plugin.Simkl
         /// <inheritdoc />
         public IEnumerable<PluginPageInfo> GetPages()
         {
+            // Admin configuration page
             yield return new PluginPageInfo
             {
                 Name = Name,
                 EmbeddedResourcePath = GetType().Namespace + ".Configuration.configPage.html"
+            };
+
+            // User configuration page
+            yield return new PluginPageInfo
+            {
+                Name = Name + " Settings",
+                EmbeddedResourcePath = GetType().Namespace + ".Configuration.userConfigPage.html",
+                EnableInMainMenu = true
             };
         }
     }

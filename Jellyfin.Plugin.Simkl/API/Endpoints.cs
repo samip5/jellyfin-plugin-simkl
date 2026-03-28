@@ -84,6 +84,16 @@ namespace Jellyfin.Plugin.Simkl.API
         }
 
         /// <summary>
+        /// Test endpoint to check if routing works.
+        /// </summary>
+        /// <returns>Simple test response.</returns>
+        [HttpGet("test")]
+        public IActionResult TestEndpoint()
+        {
+            return Ok(new { message = "Simkl plugin API is working!", timestamp = DateTime.Now });
+        }
+
+        /// <summary>
         /// Serves the user configuration page.
         /// </summary>
         /// <returns>The user configuration HTML page.</returns>

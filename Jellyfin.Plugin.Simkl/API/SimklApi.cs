@@ -1,6 +1,5 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Diagnostics.Tracing;
 using System.IO;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -25,33 +24,33 @@ namespace Jellyfin.Plugin.Simkl.API
     /// </summary>
     public class SimklApi
     {
-        /* INTERFACES */
-        private readonly ILogger<SimklApi> _logger;
-        private readonly IHttpClientFactory _httpClientFactory;
-        private readonly JsonSerializerOptions _jsonSerializerOptions;
-        private readonly JsonSerializerOptions _caseInsensitiveJsonSerializerOptions;
-
         /* BASIC API THINGS */
 
         /// <summary>
         /// Base url.
         /// </summary>
-        public const string Baseurl = @"https://api.simkl.com";
+        private const string Baseurl = @"https://api.simkl.com";
 
         /// <summary>
         /// Redirect uri.
         /// </summary>
-        public const string RedirectUri = @"https://simkl.com/apps/jellyfin/connected/";
+        private const string RedirectUri = @"https://simkl.com/apps/jellyfin/connected/";
 
         /// <summary>
         /// Api key.
         /// </summary>
-        public const string Apikey = @"c721b22482097722a84a20ccc579cf9d232be85b9befe7b7805484d0ddbc6781";
+        private const string Apikey = @"c721b22482097722a84a20ccc579cf9d232be85b9befe7b7805484d0ddbc6781";
 
         /// <summary>
         /// Secret.
         /// </summary>
-        public const string Secret = @"87893fc73cdbd2e51a7c63975c6f941ac1c6155c0e20ffa76b83202dd10a507e";
+        private const string Secret = @"87893fc73cdbd2e51a7c63975c6f941ac1c6155c0e20ffa76b83202dd10a507e";
+
+        /* INTERFACES */
+        private readonly ILogger<SimklApi> _logger;
+        private readonly IHttpClientFactory _httpClientFactory;
+        private readonly JsonSerializerOptions _jsonSerializerOptions;
+        private readonly JsonSerializerOptions _caseInsensitiveJsonSerializerOptions;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="SimklApi"/> class.
@@ -124,8 +123,8 @@ namespace Jellyfin.Plugin.Simkl.API
             _logger.LogDebug("History: {@History}", history);
             _logger.LogDebug("Response: {@Response}", r);
             if (r != null && history.Movies.Count == r.Added.Movies
-                && history.Shows.Count == r.Added.Shows
-                && history.Episodes.Count == r.Added.Episodes)
+                          && history.Shows.Count == r.Added.Shows
+                          && history.Episodes.Count == r.Added.Episodes)
             {
                 return (true, item);
             }
@@ -355,7 +354,19 @@ namespace Jellyfin.Plugin.Simkl.API
             {
                 _logger.LogDebug("Scrobble start for {ItemName} at {Percentage:F1}%", item.Name, percentageWatched);
                 var request = CreateScrobbleRequestFromItem(item, percentageWatched);
-                return await Post<SyncPlaybackResponse, ScrobbleRequest>("/scrobble/start", userToken, request);
+                _logger.LogDebug(
+                    "Scrobble request data: {RequestData}",
+                    JsonSerializer.Serialize(request));
+
+                var response = await Post<SyncPlaybackResponse, ScrobbleRequest>("/scrobble/start", userToken, request);
+
+                // Check for Simkl API errors and provide helpful logging
+                if (response != null && !string.IsNullOrEmpty(response.Error))
+                {
+                    SimklErrorHandler.LogError(_logger, response.Error, item, request);
+                }
+
+                return response;
             }
             catch (HttpRequestException e) when (e.StatusCode == System.Net.HttpStatusCode.Unauthorized)
             {
@@ -379,7 +390,16 @@ namespace Jellyfin.Plugin.Simkl.API
             {
                 _logger.LogDebug("Scrobble stop for {ItemName} at {Percentage:F1}%", item.Name, percentageWatched);
                 var request = CreateScrobbleRequestFromItem(item, percentageWatched);
-                return await Post<SyncPlaybackResponse, ScrobbleRequest>("/scrobble/stop", userToken, request);
+
+                var response = await Post<SyncPlaybackResponse, ScrobbleRequest>("/scrobble/stop", userToken, request);
+
+                // Check for Simkl API errors and provide helpful logging
+                if (response != null && !string.IsNullOrEmpty(response.Error))
+                {
+                    SimklErrorHandler.LogError(_logger, response.Error, item, request);
+                }
+
+                return response;
             }
             catch (HttpRequestException e) when (e.StatusCode == System.Net.HttpStatusCode.Unauthorized)
             {
@@ -434,7 +454,7 @@ namespace Jellyfin.Plugin.Simkl.API
         /// <param name="userToken">Authentication token.</param>
         /// <param name="data">Object to serialize.</param>
         private async Task<T1?> Post<T1, T2>(string url, string? userToken = null, T2? data = null)
-         where T2 : class
+            where T2 : class
         {
             using var options = GetOptions(userToken);
             options.RequestUri = new Uri(Baseurl + url);

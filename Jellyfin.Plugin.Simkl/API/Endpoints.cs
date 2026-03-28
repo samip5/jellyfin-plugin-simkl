@@ -1,6 +1,4 @@
 ﻿using System;
-using System.IO;
-using System.Reflection;
 using System.Security.Claims;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.Simkl.API.Objects;
@@ -84,39 +82,6 @@ namespace Jellyfin.Plugin.Simkl.API
         }
 
         /// <summary>
-        /// Test endpoint to check if routing works.
-        /// </summary>
-        /// <returns>Simple test response.</returns>
-        [HttpGet("test")]
-        public IActionResult TestEndpoint()
-        {
-            return Ok(new { message = "Simkl plugin API is working!", timestamp = DateTime.Now });
-        }
-
-        /// <summary>
-        /// Serves the user configuration page.
-        /// </summary>
-        /// <returns>The user configuration HTML page.</returns>
-        [HttpGet("settings")]
-        [Authorize]
-        public IActionResult GetUserSettingsPage()
-        {
-            var assembly = Assembly.GetExecutingAssembly();
-            var resourceName = "Jellyfin.Plugin.Simkl.Configuration.userConfigPage.html";
-
-            using var stream = assembly.GetManifestResourceStream(resourceName);
-            if (stream == null)
-            {
-                return NotFound("User configuration page not found");
-            }
-
-            using var reader = new StreamReader(stream);
-            var content = reader.ReadToEnd();
-
-            return Content(content, "text/html");
-        }
-
-        /// <summary>
         /// Sends a scrobble start (now watching) update for the given item.
         /// </summary>
         /// <param name="userId">The user id.</param>
@@ -124,7 +89,6 @@ namespace Jellyfin.Plugin.Simkl.API
         /// <param name="progress">Playback progress as a percentage (0–100).</param>
         /// <returns>The scrobble response.</returns>
         [HttpPost("scrobble/start/{userId}")]
-        [Authorize]
         public async Task<ActionResult<SyncPlaybackResponse?>> ScrobbleStart(
             [FromRoute] Guid userId,
             [FromBody] MediaBrowser.Model.Dto.BaseItemDto item,
@@ -148,7 +112,6 @@ namespace Jellyfin.Plugin.Simkl.API
         /// <returns>The sync playback response.</returns>
         [HttpPost("sync/playback/{userId}")]
         [Obsolete("Use POST /Simkl/scrobble/start/{userId}?progress=<float> instead.")]
-        [Authorize]
         public async Task<ActionResult<SyncPlaybackResponse?>> SyncPlayback(
             [FromRoute] Guid userId,
             [FromBody] MediaBrowser.Model.Dto.BaseItemDto item)

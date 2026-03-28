@@ -12,3 +12,5 @@ description: >
 category: "General"
 artifacts:
   - "Jellyfin.Plugin.Simkl.dll"
+changelog: |-
+  - Move to Simkl live-scrobbling @samip5

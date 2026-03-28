@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Data.Enums;
@@ -200,6 +201,10 @@ namespace Jellyfin.Plugin.Simkl.Services
                     _lastNowWatching[sessionKey] = DateTime.UtcNow;
                     _logger.LogDebug("Sent now watching without errors");
                 }
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogDebug(ex, "Couldn't deserialize now watching response. Raw body: {Body}", ex.Message);
             }
             catch (InvalidTokenException)
             {

@@ -294,7 +294,7 @@ namespace Jellyfin.Plugin.Simkl.API
         {
             try
             {
-                _logger.LogInformation("Syncing Playback");
+                _logger.LogDebug("Syncing playback for {ItemName} at {Percentage:F1}%", item.Name, percentageWatched);
                 var playback = CreatePlaybackFromItem(item, percentageWatched);
                 return await Post<SyncPlaybackResponse, SimklPlayback>("/sync/playback", userToken, playback);
             }
@@ -367,8 +367,10 @@ namespace Jellyfin.Plugin.Simkl.API
 
             var responseMessage = await _httpClientFactory.CreateClient(NamedClient.Default)
                 .SendAsync(options);
+            var json = await responseMessage.Content.ReadAsStringAsync().ConfigureAwait(false);
+            _logger.LogDebug("Simkl API raw response for {Url}: {Json}", url, json);
 
-            return await responseMessage.Content.ReadFromJsonAsync<T1>(_caseInsensitiveJsonSerializerOptions);
+            return JsonSerializer.Deserialize<T1>(json, _caseInsensitiveJsonSerializerOptions);
         }
     }
 }

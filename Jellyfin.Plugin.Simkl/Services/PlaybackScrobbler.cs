@@ -23,8 +23,8 @@ namespace Jellyfin.Plugin.Simkl.Services
     /// </summary>
     public class PlaybackScrobbler : IHostedService
     {
-        private const int ScrobbleThrottleSeconds = 30;
-        private const int NowWatchingThrottleSeconds = 10;
+        private const int ScrobbleThrottleSeconds = 120;
+        private const int NowWatchingThrottleSeconds = 25;
 
         private readonly ISessionManager _sessionManager;
         private readonly ILogger<PlaybackScrobbler> _logger;

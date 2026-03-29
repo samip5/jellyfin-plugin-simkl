@@ -8,8 +8,6 @@ using Jellyfin.Data.Enums;
 using Jellyfin.Plugin.Simkl.API;
 using Jellyfin.Plugin.Simkl.API.Exceptions;
 using Jellyfin.Plugin.Simkl.Configuration;
-using MediaBrowser.Controller.Entities;
-using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Session;
 using MediaBrowser.Model.Dto;
@@ -29,7 +27,6 @@ namespace Jellyfin.Plugin.Simkl.Services
         private readonly ISessionManager _sessionManager;
         private readonly ILogger<PlaybackScrobbler> _logger;
         private readonly SimklApi _simklApi;
-        private readonly ILibraryManager _libraryManager;
 
         /// <summary>
         /// Tracks the last successfully scrobbled item per session,
@@ -55,17 +52,14 @@ namespace Jellyfin.Plugin.Simkl.Services
         /// <param name="sessionManager">Instance of the <see cref="ISessionManager"/> interface.</param>
         /// <param name="logger">Instance of the <see cref="ILogger{PlaybackScrobbler}"/> interface.</param>
         /// <param name="simklApi">Instance of the <see cref="SimklApi"/>.</param>
-        /// <param name="libraryManager">Instance of the <see cref="ILibraryManager"/> interface.</param>
         public PlaybackScrobbler(
             ISessionManager sessionManager,
             ILogger<PlaybackScrobbler> logger,
-            SimklApi simklApi,
-            ILibraryManager libraryManager)
+            SimklApi simklApi)
         {
             _sessionManager = sessionManager;
             _logger = logger;
             _simklApi = simklApi;
-            _libraryManager = libraryManager;
             _lastScrobbled = new Dictionary<string, Guid>();
             _nextScrobbleTry = new Dictionary<string, DateTime>();
             _lastNowWatching = new Dictionary<string, DateTime>();
@@ -199,11 +193,8 @@ namespace Jellyfin.Plugin.Simkl.Services
                     percentageWatched,
                     eventArgs.Session.UserName);
 
-                // Get corrected item with proper series metadata for episodes
-                var scrobbleItem = await GetScrobbleItemAsync(eventArgs.MediaInfo);
-
                 var response = await _simklApi
-                    .ScrobbleStartAsync(scrobbleItem, userConfig.UserToken, percentageWatched)
+                    .ScrobbleStartAsync(eventArgs.MediaInfo, userConfig.UserToken, percentageWatched)
                     .ConfigureAwait(false);
 
                 if (response != null && string.IsNullOrEmpty(response.Error))
@@ -274,11 +265,8 @@ namespace Jellyfin.Plugin.Simkl.Services
                     ? (float)position.Value / runtime.Value * 100f
                     : userConfig.ScrobblePercentage;
 
-                // Get corrected item with proper series metadata for episodes
-                var scrobbleItem = await GetScrobbleItemAsync(eventArgs.MediaInfo);
-
                 var response = await _simklApi
-                    .ScrobbleStopAsync(scrobbleItem, userConfig.UserToken, percentageWatched)
+                    .ScrobbleStopAsync(eventArgs.MediaInfo, userConfig.UserToken, percentageWatched)
                     .ConfigureAwait(false);
 
                 if (response != null && string.IsNullOrEmpty(response.Error))
@@ -313,81 +301,6 @@ namespace Jellyfin.Plugin.Simkl.Services
                     "Caught unknown exception while trying to scrobble {ItemName}",
                     eventArgs.MediaInfo.Name);
             }
-        }
-
-        /// <summary>
-        /// Gets the appropriate BaseItemDto for scrobbling with corrected metadata.
-        ///
-        /// Problem: For episodes, Jellyfin's BaseItemDto contains episode-level metadata
-        /// (episode production year, episode provider IDs) but Simkl's API requires
-        /// show-level metadata to identify the series. Sending episode IDs as show IDs
-        /// causes "id_err" responses from Simkl because it can't find the show.
-        ///
-        /// Solution: For episodes, fetch the parent series entity and use its metadata
-        /// (series production year, series provider IDs) for show identification while
-        /// keeping episode-specific data (season/episode numbers) for episode identification.
-        /// </summary>
-        /// <param name="item">The original media item from Jellyfin.</param>
-        /// <returns>BaseItemDto with corrected metadata for scrobbling.</returns>
-        private async Task<BaseItemDto> GetScrobbleItemAsync(BaseItemDto item)
-        {
-            // For non-episodes, return as-is
-            if (item.Type != BaseItemKind.Episode)
-            {
-                return item;
-            }
-
-            try
-            {
-                // For episodes, fetch the parent series to get correct show-level metadata
-                // Using Task.Run to avoid blocking the thread during library access
-                var episodeEntity = await Task.Run(() => _libraryManager.GetItemById(item.Id));
-                if (episodeEntity is Episode episode && episode.Series != null)
-                {
-                    var seriesEntity = episode.Series;
-
-                    // Create corrected BaseItemDto: episode data + series metadata for proper Simkl identification
-                    var correctedItem = new BaseItemDto
-                    {
-                        // Keep episode-specific properties for episode identification
-                        Id = item.Id,
-                        Name = item.Name,
-                        Type = item.Type,
-                        IndexNumber = item.IndexNumber,          // Episode number
-                        ParentIndexNumber = item.ParentIndexNumber, // Season number
-                        SeriesName = item.SeriesName,
-
-                        // Replace episode metadata with series metadata for show identification
-                        // This fixes "id_err" by sending correct series IDs instead of episode IDs
-                        ProductionYear = seriesEntity.ProductionYear,  // Series year, not episode year
-                        ProviderIds = seriesEntity.ProviderIds,        // Series IDs (TVDB, IMDb, etc.)
-
-                        // Copy other necessary properties
-                        RunTimeTicks = item.RunTimeTicks,
-                        Path = item.Path
-                    };
-
-                    _logger.LogDebug(
-                        "Corrected episode metadata for Simkl: {SeriesName} ({SeriesYear}) S{Season}E{Episode} - Using series IDs instead of episode IDs",
-                        correctedItem.SeriesName,
-                        correctedItem.ProductionYear,
-                        correctedItem.ParentIndexNumber,
-                        correctedItem.IndexNumber);
-
-                    return correctedItem;
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(
-                    ex,
-                    "Failed to fetch series metadata for episode {EpisodeName}, using original item (may cause id_err)",
-                    item.Name);
-            }
-
-            // Fallback to original item if series lookup fails
-            // Note: This may still cause "id_err" from Simkl due to incorrect metadata
-            return item;
         }
     }
 }

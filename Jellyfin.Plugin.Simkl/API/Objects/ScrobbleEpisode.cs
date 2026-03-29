@@ -18,5 +18,11 @@ namespace Jellyfin.Plugin.Simkl.API.Objects
         /// </summary>
         [JsonPropertyName("number")]
         public int? Number { get; set; }
+
+        /// <summary>
+        /// Gets or sets the episode IDs.
+        /// </summary>
+        [JsonPropertyName("ids")]
+        public SimklEpisodeIds? Ids { get; set; }
     }
 }

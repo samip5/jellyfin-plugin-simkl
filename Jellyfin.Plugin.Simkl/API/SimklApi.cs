@@ -298,16 +298,18 @@ namespace Jellyfin.Plugin.Simkl.API
             }
             else if (item.Type == BaseItemKind.Episode)
             {
+                // For episodes: series identification by title/year, episode IDs go in episode object
                 request.Show = new ScrobbleShow
                 {
                     Title = item.SeriesName,
                     Year = item.ProductionYear,
-                    Ids = new SimklShowIds(item.ProviderIds ?? new Dictionary<string, string>())
+                    Ids = new SimklShowIds(new Dictionary<string, string>()) // Empty for series identification by title/year
                 };
                 request.Episode = new ScrobbleEpisode
                 {
                     Season = item.ParentIndexNumber,
-                    Number = item.IndexNumber
+                    Number = item.IndexNumber,
+                    Ids = new SimklEpisodeIds(item.ProviderIds ?? new Dictionary<string, string>()) // Episode IDs go here
                 };
             }
 

@@ -7,12 +7,12 @@ namespace Jellyfin.Plugin.Simkl.Configuration
     /// <summary>
     /// Class needed to create a Plugin and configure it.
     /// </summary>
-    public abstract class PluginConfiguration : BasePluginConfiguration
+    public class PluginConfiguration : BasePluginConfiguration
     {
         /// <summary>
         /// Initializes a new instance of the <see cref="PluginConfiguration"/> class.
         /// </summary>
-        protected PluginConfiguration()
+        public PluginConfiguration()
         {
             UserConfigs = Array.Empty<UserConfig>();
         }
@@ -20,7 +20,7 @@ namespace Jellyfin.Plugin.Simkl.Configuration
         /// <summary>
         /// Gets or sets the list of user configs.
         /// </summary>
-        private UserConfig[] UserConfigs { get; set; }
+        public UserConfig[] UserConfigs { get; set; }
 
         /// <summary>
         /// Get config by id.

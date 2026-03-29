@@ -412,6 +412,38 @@ namespace Jellyfin.Plugin.Simkl.API
         }
 
         /// <summary>
+        /// Calls /scrobble/pause to save progress when playback is paused.
+        /// </summary>
+        /// <param name="item">The item being paused.</param>
+        /// <param name="userToken">User token.</param>
+        /// <param name="percentageWatched">Percentage watched when paused.</param>
+        /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+        public async Task<SyncPlaybackResponse?> ScrobblePauseAsync(BaseItemDto item, string userToken, float percentageWatched)
+        {
+            try
+            {
+                _logger.LogDebug("Scrobble pause for {ItemName} at {Percentage:F1}%", item.Name, percentageWatched);
+                var request = CreateScrobbleRequestFromItem(item, percentageWatched);
+
+                var response = await Post<SyncPlaybackResponse, ScrobbleRequest>("/scrobble/pause", userToken, request);
+
+                // Check for Simkl API errors and provide helpful logging
+                if (response != null && !string.IsNullOrEmpty(response.Error))
+                {
+                    SimklErrorHandler.LogError(_logger, response.Error, item, request);
+                }
+
+                return response;
+            }
+            catch (HttpRequestException e) when (e.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+            {
+                _logger.LogError(e, "Invalid user token {UserToken}, deleting", userToken);
+                SimklPlugin.Instance?.Configuration.DeleteUserToken(userToken);
+                throw new InvalidTokenException("Invalid user token " + userToken);
+            }
+        }
+
+        /// <summary>
         /// Implements /sync/history method from simkl.
         /// </summary>
         /// <param name="history">History object.</param>

@@ -1,13 +1,14 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.IO;
+using System.Linq;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Data.Enums;
 using Jellyfin.Plugin.Simkl.API;
 using Jellyfin.Plugin.Simkl.API.Exceptions;
+using Jellyfin.Plugin.Simkl.API.Objects;
 using Jellyfin.Plugin.Simkl.Configuration;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.TV;
@@ -24,31 +25,15 @@ namespace Jellyfin.Plugin.Simkl.Services
     /// </summary>
     public class PlaybackScrobbler : IHostedService
     {
-        private const int ScrobbleThrottleSeconds = 120;
-        private const int NowWatchingThrottleSeconds = 25;
-
         private readonly ISessionManager _sessionManager;
         private readonly ILogger<PlaybackScrobbler> _logger;
         private readonly SimklApi _simklApi;
         private readonly ILibraryManager _libraryManager;
 
         /// <summary>
-        /// Tracks the last successfully scrobbled item per session,
-        /// so we don't scrobble the same item twice in one session.
+        /// Rate limiter to respect Simkl's API limits and prevent hammering.
         /// </summary>
-        private readonly ConcurrentDictionary<string, Guid> _lastScrobbled;
-
-        /// <summary>
-        /// Per-session throttle for scrobble checks during playback progress.
-        /// Scrobble eligibility is re-evaluated at most every <see cref="ScrobbleThrottleSeconds"/> seconds.
-        /// </summary>
-        private readonly ConcurrentDictionary<string, DateTime> _nextScrobbleTry;
-
-        /// <summary>
-        /// Per-session throttle for now-watching updates.
-        /// Updates are sent at most every <see cref="NowWatchingThrottleSeconds"/> seconds.
-        /// </summary>
-        private readonly ConcurrentDictionary<string, DateTime> _lastNowWatching;
+        private readonly RateLimiter<Guid> _rateLimiter;
 
         /// <summary>
         /// Per-session semaphores to prevent race conditions within each session.
@@ -56,14 +41,9 @@ namespace Jellyfin.Plugin.Simkl.Services
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _sessionSemaphores;
 
         /// <summary>
-        /// Per-user throttle for API calls to respect Simkl's 20-second rate limit per user.
+        /// Tracks the scrobble state per session to ensure proper API call sequence.
         /// </summary>
-        private readonly ConcurrentDictionary<Guid, DateTime> _nextUserApiCall;
-
-        /// <summary>
-        /// Tracks the previous pause state per session to detect pause/unpause events.
-        /// </summary>
-        private readonly ConcurrentDictionary<string, bool> _sessionPauseState;
+        private readonly ConcurrentDictionary<string, SessionScrobbleState> _sessionState;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="PlaybackScrobbler"/> class.
@@ -82,12 +62,9 @@ namespace Jellyfin.Plugin.Simkl.Services
             _logger = logger;
             _simklApi = simklApi;
             _libraryManager = libraryManager;
-            _lastScrobbled = new ConcurrentDictionary<string, Guid>();
-            _nextScrobbleTry = new ConcurrentDictionary<string, DateTime>();
-            _lastNowWatching = new ConcurrentDictionary<string, DateTime>();
             _sessionSemaphores = new ConcurrentDictionary<string, SemaphoreSlim>();
-            _nextUserApiCall = new ConcurrentDictionary<Guid, DateTime>();
-            _sessionPauseState = new ConcurrentDictionary<string, bool>();
+            _sessionState = new ConcurrentDictionary<string, SessionScrobbleState>();
+            _rateLimiter = new RateLimiter<Guid>(TimeSpan.FromSeconds(25));
         }
 
         /// <inheritdoc />
@@ -106,20 +83,12 @@ namespace Jellyfin.Plugin.Simkl.Services
             return Task.CompletedTask;
         }
 
-        private static bool CanBeScrobbled(UserConfig config, PlaybackProgressEventArgs playbackProgress)
+        private static bool CanStartScrobbling(UserConfig config, PlaybackProgressEventArgs playbackProgress)
         {
-            var position = playbackProgress.PlaybackPositionTicks;
-            var runtime = playbackProgress.MediaInfo.RunTimeTicks;
+            long? runtime = playbackProgress.MediaInfo.RunTimeTicks;
 
             // Must have a known runtime above the configured minimum length
             if (!runtime.HasValue || runtime.Value < 60 * 10000 * config.MinLength)
-            {
-                return false;
-            }
-
-            var percentageWatched = position / (float)runtime.Value * 100f;
-
-            if (percentageWatched < config.ScrobblePercentage)
             {
                 return false;
             }
@@ -129,6 +98,30 @@ namespace Jellyfin.Plugin.Simkl.Services
                 BaseItemKind.Movie => config.ScrobbleMovies,
                 BaseItemKind.Episode => config.ScrobbleShows,
                 _ => false
+            };
+        }
+
+        private static bool CanCompleteScrobble(UserConfig config, PlaybackProgressEventArgs playbackProgress)
+        {
+            if (!CanStartScrobbling(config, playbackProgress))
+            {
+                return false;
+            }
+
+            long? position = playbackProgress.PlaybackPositionTicks;
+            long? runtime = playbackProgress.MediaInfo.RunTimeTicks;
+            float percentageWatched = (float)(position ?? 0) / runtime!.Value * 100f;
+
+            return percentageWatched >= config.ScrobblePercentage;
+        }
+
+        private static PlaybackProgressEventArgs CreateProgressArgsFromStop(PlaybackStopEventArgs stopArgs)
+        {
+            return new PlaybackProgressEventArgs
+            {
+                MediaInfo = stopArgs.MediaInfo,
+                Session = stopArgs.Session,
+                PlaybackPositionTicks = stopArgs.PlaybackPositionTicks
             };
         }
 
@@ -149,11 +142,9 @@ namespace Jellyfin.Plugin.Simkl.Services
 
         private async Task OnPlaybackProgressAsync(PlaybackProgressEventArgs e)
         {
-            var userId = e.Session.UserId;
             var sessionId = e.Session.Id;
             var semaphore = _sessionSemaphores.GetOrAdd(sessionId, _ => new SemaphoreSlim(1, 1));
 
-            // Per-session semaphore prevents race conditions within this session
             if (!await semaphore.WaitAsync(0).ConfigureAwait(false))
             {
                 return;
@@ -161,37 +152,7 @@ namespace Jellyfin.Plugin.Simkl.Services
 
             try
             {
-                // Check for pause state changes and handle pause/unpause events
-                await HandlePauseStateChange(e).ConfigureAwait(false);
-
-                // Check per-user rate limit before making any API calls
-                if (_nextUserApiCall.TryGetValue(userId, out var nextUserCall) && DateTime.UtcNow < nextUserCall)
-                {
-                    return;
-                }
-
-                // Now-watching has its own per-session throttle inside SendNowWatchingAsync,
-                // so it is checked independently of the scrobble throttle.
-                var nowWatchingSent = await SendNowWatchingAsync(e).ConfigureAwait(false);
-
-                // Scrobble checks are throttled per session to avoid hammering the API.
-                if (_nextScrobbleTry.TryGetValue(sessionId, out var next) && DateTime.UtcNow < next)
-                {
-                    return;
-                }
-
-                var scrobbleSent = await ScrobbleSession(e).ConfigureAwait(false);
-
-                // Update per-user rate limit if any API call was made
-                if (nowWatchingSent || scrobbleSent)
-                {
-                    _nextUserApiCall[userId] = DateTime.UtcNow.AddSeconds(25); // Simkl's 20s + buffer
-                }
-
-                if (scrobbleSent)
-                {
-                    _nextScrobbleTry[sessionId] = DateTime.UtcNow.AddSeconds(ScrobbleThrottleSeconds);
-                }
+                await HandlePlaybackStateChange(e).ConfigureAwait(false);
             }
             finally
             {
@@ -201,295 +162,295 @@ namespace Jellyfin.Plugin.Simkl.Services
 
         private async Task OnPlaybackStoppedAsync(PlaybackStopEventArgs e)
         {
-            var userId = e.Session.UserId;
-            var sessionId = e.Session.Id;
-            var semaphore = _sessionSemaphores.GetOrAdd(sessionId, _ => new SemaphoreSlim(1, 1));
+            string? sessionId = e.Session.Id;
+            SemaphoreSlim semaphore = _sessionSemaphores.GetOrAdd(sessionId, _ => new SemaphoreSlim(1, 1));
 
             await semaphore.WaitAsync().ConfigureAwait(false);
             try
             {
-                // On stop, attempt a final scrobble unconditionally (no throttle).
-                // ScrobbleSession will still respect _lastScrobbled to avoid double-scrobbling
-                // if the item was already marked during progress.
-                //
-                // Note: if the user stops before reaching ScrobblePercentage, this will also
-                // not scrobble — CanBeScrobbled uses the position at the time of the event.
-                // This is intentional; add a separate "scrobble on stop" threshold in config
-                // if more aggressive behavior is desired.
-                var scrobbleSent = await ScrobbleSession(e).ConfigureAwait(false);
-
-                // Update per-user rate limit if API call was made
-                if (scrobbleSent)
-                {
-                    _nextUserApiCall[userId] = DateTime.UtcNow.AddSeconds(25);
-                }
+                await HandlePlaybackStop(e).ConfigureAwait(false);
             }
             finally
             {
                 semaphore.Release();
-                _sessionPauseState.TryRemove(sessionId, out _);
+                _sessionState.TryRemove(sessionId, out _);
 
-                // Clean up session semaphore when session ends
-                if (_sessionSemaphores.TryRemove(sessionId, out var removedSemaphore))
+                if (_sessionSemaphores.TryRemove(sessionId, out SemaphoreSlim? removedSemaphore))
                 {
                     removedSemaphore.Dispose();
                 }
             }
         }
 
-        private async Task HandlePauseStateChange(PlaybackProgressEventArgs e)
+        private async Task HandlePlaybackStateChange(PlaybackProgressEventArgs e)
         {
-            var sessionId = e.Session.Id;
-            var currentlyPaused = e.Session.PlayState?.IsPaused ?? false;
+            string sessionId = e.Session.Id;
+            Guid userId = e.Session.UserId;
+            bool isPaused = e.Session.PlayState?.IsPaused ?? false;
+            SessionScrobbleState currentState = _sessionState.GetOrAdd(sessionId, SessionScrobbleState.NotStarted);
+            UserConfig? userConfig = SimklPlugin.Instance?.Configuration.GetByGuid(userId);
 
-            var previouslyPaused = _sessionPauseState.GetOrAdd(sessionId, false);
-
-            if (previouslyPaused == currentlyPaused)
+            if (userConfig == null || string.IsNullOrEmpty(userConfig.UserToken))
             {
                 return;
             }
 
-            _sessionPauseState[sessionId] = currentlyPaused;
-
-            if (currentlyPaused && !previouslyPaused)
+            if (!CanStartScrobbling(userConfig, e))
             {
-                await HandlePauseEvent(e).ConfigureAwait(false);
+                return;
+            }
+
+            switch (currentState)
+            {
+                case SessionScrobbleState.NotStarted:
+                    if (!isPaused)
+                    {
+                        await SendScrobbleStart(e, userConfig).ConfigureAwait(false);
+                        _sessionState[sessionId] = SessionScrobbleState.Started;
+                    }
+
+                    break;
+
+                case SessionScrobbleState.Started:
+                    if (isPaused)
+                    {
+                        await SendScrobblePause(e, userConfig).ConfigureAwait(false);
+                        _sessionState[sessionId] = SessionScrobbleState.Paused;
+                    }
+
+                    break;
+
+                case SessionScrobbleState.Paused:
+                    if (!isPaused)
+                    {
+                        await SendScrobbleStart(e, userConfig).ConfigureAwait(false);
+                        _sessionState[sessionId] = SessionScrobbleState.Started;
+                    }
+
+                    break;
             }
         }
 
-        private async Task HandlePauseEvent(PlaybackProgressEventArgs e)
+        private async Task HandlePlaybackStop(PlaybackStopEventArgs e)
         {
-            try
+            string sessionId = e.Session.Id;
+            Guid userId = e.Session.UserId;
+            SessionScrobbleState currentState = _sessionState.GetOrAdd(sessionId, SessionScrobbleState.NotStarted);
+            UserConfig? userConfig = SimklPlugin.Instance?.Configuration.GetByGuid(userId);
+
+            if (userConfig == null || string.IsNullOrEmpty(userConfig.UserToken))
             {
-                var userId = e.Session.UserId;
-                var userConfig = SimklPlugin.Instance?.Configuration.GetByGuid(userId);
-                if (userConfig == null || string.IsNullOrEmpty(userConfig.UserToken))
+                return;
+            }
+
+            if (currentState == SessionScrobbleState.Started || currentState == SessionScrobbleState.Paused)
+            {
+                // Only send stop if we've watched enough to complete the scrobble
+                if (CanCompleteScrobble(userConfig, CreateProgressArgsFromStop(e)))
                 {
-                    return;
+                    await SendScrobbleStop(e, userConfig).ConfigureAwait(false);
                 }
 
-                var position = e.PlaybackPositionTicks;
-                var runtime = e.MediaInfo.RunTimeTicks;
+                _sessionState[sessionId] = SessionScrobbleState.Stopped;
+            }
+        }
+
+        private async Task SendScrobbleStart(PlaybackProgressEventArgs e, UserConfig userConfig)
+        {
+            Guid userId = e.Session.UserId;
+
+            if (!_rateLimiter.CanExecute(userId, DateTime.UtcNow))
+            {
+                _logger.LogDebug("Rate limit hit for user {UserName}, skipping API call", e.Session.UserName);
+                return;
+            }
+
+            try
+            {
+                long? position = e.PlaybackPositionTicks;
+                long? runtime = e.MediaInfo.RunTimeTicks;
 
                 if (!runtime.HasValue || runtime.Value == 0 || !position.HasValue)
                 {
                     return;
                 }
 
-                var percentageWatched = (float)position / runtime.Value * 100f;
+                float percentageWatched = (float)position / runtime.Value * 100f;
 
                 _logger.LogDebug(
-                    "Sending pause for {Name} ({Progress:F1}%) for {UserName}",
+                    "Sending scrobble start for {Name} ({Progress:F1}%) for {UserName}",
                     e.MediaInfo.Name,
                     percentageWatched,
                     e.Session.UserName);
 
-                var scrobbleItem = await GetScrobbleItemAsync(e.MediaInfo);
+                BaseItemDto scrobbleItem = await GetScrobbleItemAsync(e.MediaInfo);
+                var response = await _simklApi.ScrobbleStartAsync(scrobbleItem, userConfig.UserToken, percentageWatched);
 
-                var response = await _simklApi
-                    .ScrobblePauseAsync(scrobbleItem, userConfig.UserToken, percentageWatched)
-                    .ConfigureAwait(false);
-
-                if (response != null && string.IsNullOrEmpty(response.Error))
-                {
-                    _logger.LogDebug("Pause sent successfully for {Name}", e.MediaInfo.Name);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error sending pause for {Name}", e.MediaInfo.Name);
-            }
-        }
-
-        private async Task<bool> SendNowWatchingAsync(PlaybackProgressEventArgs eventArgs)
-        {
-            try
-            {
-                var userId = eventArgs.Session.UserId;
-                var userConfig = SimklPlugin.Instance?.Configuration.GetByGuid(userId);
-                if (userConfig == null || string.IsNullOrEmpty(userConfig.UserToken))
-                {
-                    return false;
-                }
-
-                var isPaused = eventArgs.Session.PlayState?.IsPaused ?? false;
-                if (isPaused)
-                {
-                    return false;
-                }
-
-                var position = eventArgs.PlaybackPositionTicks;
-                var runtime = eventArgs.MediaInfo.RunTimeTicks;
-
-                if (!runtime.HasValue || runtime.Value == 0 || !position.HasValue)
-                {
-                    return false;
-                }
-
-                var runtimeValue = runtime.Value;
-                var percentageWatched = (float)position / runtimeValue * 100f;
-
-                if (percentageWatched < userConfig.ScrobbleNowWatchingPercentage)
-                {
-                    return false;
-                }
-
-                // Per-session throttle: don't send more than once every NowWatchingThrottleSeconds.
-                var sessionKey = eventArgs.Session.Id;
-                if (_lastNowWatching.TryGetValue(sessionKey, out var lastUpdate) &&
-                    (DateTime.UtcNow - lastUpdate).TotalSeconds < NowWatchingThrottleSeconds)
-                {
-                    return false;
-                }
-
-                _logger.LogDebug(
-                    "Sending now watching for {Name} ({Progress:F1}%) for {UserName}",
-                    eventArgs.MediaInfo.Name,
-                    percentageWatched,
-                    eventArgs.Session.UserName);
-
-                // Get corrected item with proper series metadata for episodes
-                var scrobbleItem = await GetScrobbleItemAsync(eventArgs.MediaInfo);
-
-                var response = await _simklApi
-                    .ScrobbleStartAsync(scrobbleItem, userConfig.UserToken, percentageWatched)
-                    .ConfigureAwait(false);
+                _rateLimiter.MarkExecuted(userId, DateTime.UtcNow);
 
                 if (response != null && string.IsNullOrEmpty(response.Error))
                 {
-                    _lastNowWatching[sessionKey] = DateTime.UtcNow;
-                    _logger.LogDebug("Scrobble start sent (action: {Action})", response.Action);
+                    _logger.LogInformation("Scrobble start sent successfully for {Name} by user {UserName}", e.MediaInfo.Name, e.Session.UserName);
                 }
-
-                return false;
+                else if (response != null && !string.IsNullOrEmpty(response.Error))
+                {
+                    _logger.LogWarning("Simkl API returned error for scrobble start of {Name}: {Error}", e.MediaInfo.Name, response.Error);
+                }
+                else
+                {
+                    _logger.LogWarning("Simkl API returned null response for scrobble start of {Name}", e.MediaInfo.Name);
+                }
             }
             catch (JsonException ex)
             {
-                _logger.LogDebug(ex, "Couldn't deserialize now watching response. Raw body: {Body}", ex.Message);
-                return false;
+                _logger.LogTrace(ex, "Couldn't deserialize scrobble start response. Raw body: {Body}", ex.Message);
             }
             catch (InvalidTokenException)
             {
+                _rateLimiter.MarkExecuted(userId, DateTime.UtcNow);
                 _logger.LogWarning(
-                    "Invalid token for user {UserName} while sending now watching; token should be cleared",
-                    eventArgs.Session.UserName);
-                return false;
+                    "Invalid token for user {UserName} while sending scrobble start; token should be cleared",
+                    e.Session.UserName);
             }
             catch (Exception ex)
             {
-                _logger.LogDebug(ex, "Couldn't send now watching update");
-                return false;
+                _logger.LogError(ex, "Exception occurred while sending scrobble start for {Name} by user {UserName}", e.MediaInfo.Name, e.Session.UserName);
             }
         }
 
-        private async Task<bool> ScrobbleSession(PlaybackProgressEventArgs eventArgs)
+        private async Task SendScrobblePause(PlaybackProgressEventArgs e, UserConfig userConfig)
         {
+            Guid userId = e.Session.UserId;
+
+            if (!_rateLimiter.CanExecute(userId, DateTime.UtcNow))
+            {
+                _logger.LogDebug("Rate limit hit for user {UserName}, skipping API call", e.Session.UserName);
+                return;
+            }
+
             try
             {
-                var userId = eventArgs.Session.UserId;
-                var userConfig = SimklPlugin.Instance?.Configuration.GetByGuid(userId);
-                if (userConfig == null || string.IsNullOrEmpty(userConfig.UserToken))
+                long? position = e.PlaybackPositionTicks;
+                long? runtime = e.MediaInfo.RunTimeTicks;
+
+                if (!runtime.HasValue || runtime.Value == 0 || !position.HasValue)
                 {
-                    _logger.LogInformation(
-                        "Can't scrobble: User {UserName} not logged in (userConfig is null: {IsNull})",
-                        eventArgs.Session.UserName,
-                        userConfig == null);
-                    return false;
+                    return;
                 }
 
-                if (!CanBeScrobbled(userConfig, eventArgs))
+                float percentageWatched = (float)position / runtime.Value * 100f;
+
+                _logger.LogDebug(
+                    "Sending scrobble pause for {Name} ({Progress:F1}%) for {UserName}",
+                    e.MediaInfo.Name,
+                    percentageWatched,
+                    e.Session.UserName);
+
+                BaseItemDto scrobbleItem = await GetScrobbleItemAsync(e.MediaInfo);
+                var response = await _simklApi.ScrobblePauseAsync(scrobbleItem, userConfig.UserToken, percentageWatched);
+
+                // Always mark as executed to prevent hammering on failures
+                _rateLimiter.MarkExecuted(userId, DateTime.UtcNow);
+
+                if (response != null && string.IsNullOrEmpty(response.Error))
                 {
-                    return false;
+                    _logger.LogInformation("Scrobble pause sent successfully for {Name} by user {UserName}", e.MediaInfo.Name, e.Session.UserName);
+                }
+                else if (response != null && !string.IsNullOrEmpty(response.Error))
+                {
+                    _logger.LogWarning("Simkl API returned error for scrobble pause of {Name}: {Error}", e.MediaInfo.Name, response.Error);
+                }
+                else
+                {
+                    _logger.LogWarning("Simkl API returned null response for scrobble pause of {Name}", e.MediaInfo.Name);
+                }
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogTrace(ex, "Couldn't deserialize scrobble pause response. Raw body: {Body}", ex.Message);
+            }
+            catch (InvalidTokenException)
+            {
+                _rateLimiter.MarkExecuted(userId, DateTime.UtcNow);
+                _logger.LogWarning(
+                    "Invalid token for user {UserName} while sending scrobble pause; token should be cleared",
+                    e.Session.UserName);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Exception occurred while sending scrobble pause for {Name} by user {UserName}", e.MediaInfo.Name, e.Session.UserName);
+            }
+        }
+
+        private async Task SendScrobbleStop(PlaybackStopEventArgs e, UserConfig userConfig)
+        {
+            Guid userId = e.Session.UserId;
+
+            if (!_rateLimiter.CanExecute(userId, DateTime.UtcNow))
+            {
+                _logger.LogDebug("Rate limit hit for user {UserName}, skipping API call", e.Session.UserName);
+                return;
+            }
+
+            try
+            {
+                long? position = e.PlaybackPositionTicks;
+                long? runtime = e.MediaInfo.RunTimeTicks;
+
+                if (!runtime.HasValue || runtime.Value == 0 || !position.HasValue)
+                {
+                    return;
                 }
 
-                if (_lastScrobbled.TryGetValue(eventArgs.Session.Id, out var lastId) &&
-                    lastId == eventArgs.MediaInfo.Id)
-                {
-                    _logger.LogDebug(
-                        "Already scrobbled {ItemName} for {UserName}, skipping",
-                        eventArgs.MediaInfo.Name,
-                        eventArgs.Session.UserName);
-                    return false;
-                }
+                float percentageWatched = (float)position / runtime.Value * 100f;
 
-                _logger.LogInformation(
-                    "Scrobbling {Name} ({ItemId}) for {UserName} ({UserId}) - {Path} on session {SessionId}",
-                    eventArgs.MediaInfo.Name,
-                    eventArgs.MediaInfo.Id,
-                    eventArgs.Session.UserName,
-                    userId,
-                    eventArgs.MediaInfo.Path,
-                    eventArgs.Session.Id);
+                _logger.LogDebug(
+                    "Sending scrobble stop for {Name} ({Progress:F1}%) for {UserName}",
+                    e.MediaInfo.Name,
+                    percentageWatched,
+                    e.Session.UserName);
 
-                var position = eventArgs.PlaybackPositionTicks;
-                var runtime = eventArgs.MediaInfo.RunTimeTicks;
-                var percentageWatched = position.HasValue && runtime.HasValue && runtime.Value > 0
-                    ? (float)position.Value / runtime.Value * 100f
-                    : userConfig.ScrobblePercentage;
+                BaseItemDto scrobbleItem = await GetScrobbleItemAsync(e.MediaInfo);
+                var response = await _simklApi.ScrobbleStopAsync(scrobbleItem, userConfig.UserToken, percentageWatched);
 
-                // Get corrected item with proper series metadata for episodes
-                var scrobbleItem = await GetScrobbleItemAsync(eventArgs.MediaInfo);
-
-                var response = await _simklApi
-                    .ScrobbleStopAsync(scrobbleItem, userConfig.UserToken, percentageWatched)
-                    .ConfigureAwait(false);
+                _rateLimiter.MarkExecuted(userId, DateTime.UtcNow);
 
                 if (response != null && string.IsNullOrEmpty(response.Error))
                 {
                     _logger.LogInformation(
                         "Successfully scrobbled {Name} for {UserName} (action: {Action})",
-                        eventArgs.MediaInfo.Name,
-                        eventArgs.Session.UserName,
+                        e.MediaInfo.Name,
+                        e.Session.UserName,
                         response.Action);
-                    _lastScrobbled[eventArgs.Session.Id] = eventArgs.MediaInfo.Id;
-                    return true;
                 }
-
-                return false;
+                else if (response != null && !string.IsNullOrEmpty(response.Error))
+                {
+                    _logger.LogWarning("Simkl API returned error for scrobble stop of {Name}: {Error}", e.MediaInfo.Name, response.Error);
+                }
+                else
+                {
+                    _logger.LogWarning("Simkl API returned null response for scrobble stop of {Name}", e.MediaInfo.Name);
+                }
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogTrace(ex, "Couldn't deserialize scrobble stop response. Raw body: {Body}", ex.Message);
             }
             catch (InvalidTokenException)
             {
+                _rateLimiter.MarkExecuted(userId, DateTime.UtcNow);
                 _logger.LogWarning(
-                    "Invalid token for user {UserName} while scrobbling; token should be cleared",
-                    eventArgs.Session.UserName);
-                return false;
-            }
-            catch (InvalidDataException ex)
-            {
-                _logger.LogError(
-                    ex,
-                    "Couldn't scrobble {ItemName} — bad data; marking as scrobbled to prevent retry loop",
-                    eventArgs.MediaInfo.Name);
-                _lastScrobbled[eventArgs.Session.Id] = eventArgs.MediaInfo.Id;
-                return false;
+                    "Invalid token for user {UserName} while sending scrobble stop; token should be cleared",
+                    e.Session.UserName);
             }
             catch (Exception ex)
             {
-                _logger.LogError(
-                    ex,
-                    "Caught unknown exception while trying to scrobble {ItemName}",
-                    eventArgs.MediaInfo.Name);
-                return false;
+                _logger.LogError(ex, "Exception occurred while sending scrobble stop for {Name} by user {UserName}", e.MediaInfo.Name, e.Session.UserName);
             }
         }
 
-        /// <summary>
-        /// Gets the appropriate BaseItemDto for scrobbling with corrected metadata.
-        ///
-        /// Problem: For episodes, Jellyfin's BaseItemDto contains episode-level metadata
-        /// (episode production year, episode provider IDs) but Simkl's API requires
-        /// show-level metadata to identify the series. Sending episode IDs as show IDs
-        /// causes "id_err" responses from Simkl because it can't find the show.
-        ///
-        /// Solution: For episodes, fetch the parent series entity and use its metadata
-        /// (series production year, series provider IDs) for show identification while
-        /// keeping episode-specific data (season/episode numbers) for episode identification.
-        /// </summary>
-        /// <param name="item">The original media item from Jellyfin.</param>
-        /// <returns>BaseItemDto with corrected metadata for scrobbling.</returns>
         private async Task<BaseItemDto> GetScrobbleItemAsync(BaseItemDto item)
         {
-            // For non-episodes, return as-is
             if (item.Type != BaseItemKind.Episode)
             {
                 return item;
@@ -497,54 +458,32 @@ namespace Jellyfin.Plugin.Simkl.Services
 
             try
             {
-                // For episodes, fetch the parent series to get correct show-level metadata
-                // Using Task.Run to avoid blocking the thread during library access
                 var episodeEntity = await Task.Run(() => _libraryManager.GetItemById(item.Id));
                 if (episodeEntity is Episode episode && episode.Series != null)
                 {
-                    var seriesEntity = episode.Series;
+                    Series seriesEntity = episode.Series;
 
-                    // Create corrected BaseItemDto: episode data + series metadata for proper Simkl identification
                     var correctedItem = new BaseItemDto
                     {
-                        // Keep episode-specific properties for episode identification
                         Id = item.Id,
                         Name = item.Name,
                         Type = item.Type,
-                        IndexNumber = item.IndexNumber,          // Episode number
-                        ParentIndexNumber = item.ParentIndexNumber, // Season number
+                        IndexNumber = item.IndexNumber,
+                        ParentIndexNumber = item.ParentIndexNumber,
                         SeriesName = item.SeriesName,
-
-                        // Replace episode metadata with series metadata for show identification
-                        // This fixes "id_err" by sending correct series IDs instead of episode IDs
-                        ProductionYear = seriesEntity.ProductionYear,  // Series year, not episode year
-                        ProviderIds = seriesEntity.ProviderIds,        // Series IDs (TVDB, IMDb, etc.)
-
-                        // Copy other necessary properties
-                        RunTimeTicks = item.RunTimeTicks,
-                        Path = item.Path
+                        ProductionYear = seriesEntity.ProductionYear,
+                        ProviderIds = seriesEntity.ProviderIds?.ToDictionary(kvp => kvp.Key, kvp => kvp.Value) ?? new Dictionary<string, string>(),
+                        RunTimeTicks = item.RunTimeTicks
                     };
-
-                    _logger.LogDebug(
-                        "Corrected episode metadata for Simkl: {SeriesName} ({SeriesYear}) S{Season}E{Episode} - Using series IDs instead of episode IDs",
-                        correctedItem.SeriesName,
-                        correctedItem.ProductionYear,
-                        correctedItem.ParentIndexNumber,
-                        correctedItem.IndexNumber);
 
                     return correctedItem;
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(
-                    ex,
-                    "Failed to fetch series metadata for episode {EpisodeName}, using original item (may cause id_err)",
-                    item.Name);
+                _logger.LogWarning(ex, "Failed to correct episode metadata for {ItemName}, using original", item.Name);
             }
 
-            // Fallback to original item if series lookup fails
-            // Note: This may still cause "id_err" from Simkl due to incorrect metadata
             return item;
         }
     }
